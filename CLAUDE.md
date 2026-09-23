@@ -83,7 +83,6 @@ Styling is Tailwind utility classes inline in JSX.
 
 ## Notes
 
-- This directory is not currently a git repository.
 - `backend/.env` / `backend/.env.example` hold the AI provider settings (`AI_PROVIDER`,
   `OPENROUTER_API_KEY`, `OPENROUTER_BASE_URL`, `OPENROUTER_MODEL`, `YOUR_SITE_URL`, `YOUR_SITE_NAME`,
   `LOCAL_AI_BASE_URL`, `LOCAL_AI_MODEL`) plus `DATABASE_URL`; `Settings` (`app/config.py`) reads from

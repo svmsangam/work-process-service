@@ -27,10 +27,12 @@ OPENROUTER_API_KEY=<your key>
 OPENROUTER_MODEL=nex-agi/nex-n2.5-pro:free
 ```
 
-Start Postgres (from the repo root) and run the API:
+Configure PostgreSQL and run the API. You can either start PostgreSQL in the included Docker
+container or connect to an existing local or remote PostgreSQL server by setting its connection
+string in `backend/.env` as `DATABASE_URL`:
 
 ```bash
-docker-compose up -d          # starts Postgres on localhost:5432
+docker-compose up -d          # optional: starts Postgres on localhost:5432
 uvicorn app.main:app --reload --port 8000
 ```
 
@@ -124,11 +126,18 @@ FastAPI `BackgroundTasks`, so the HTTP response returns immediately (item stays 
 it was) while analysis runs after. The frontend polls every 4 seconds while any item is
 `RECEIVED`/`ANALYSING`, so the UI reflects completion without a manual refresh.
 
-### Data integrity
+### Data Integrity & Architecture
 
 - `WorkItem.external_id` has a database-level unique constraint; duplicate ingestion is rejected by
   catching `IntegrityError` and returning `409`, not a pre-check query (avoids a race between
   check and insert).
+- In a multi-tenant system, a single-column `external_id` constraint is insufficient because
+  different tenants may submit the same identifier, such as two clients both uploading `CRM-101`.
+  Scope uniqueness with a composite constraint such as
+  `UniqueConstraint('tenant_id', 'external_id')`.
+- Enforce tenant data isolation with tenant-aware middleware or database Row-Level Security (RLS),
+  so tenant context is applied automatically across queries rather than relying on each call site
+  to filter results correctly.
 - Status writes go through `db.commit()` and are rolled back on failure before writing the
   `FAILED` state, so a failed AI call can't leave the row half-updated.
 - There's a single `work_items` table today (no foreign keys / relations yet).
@@ -165,6 +174,13 @@ retry is rejected unless the item is currently `FAILED`).
   task silently (the item just sits in `ANALYSING` forever). Moving to Celery/RQ with Redis or
   RabbitMQ would give persistent queuing, retry policies with backoff, and horizontal worker
   scaling independent of the API process.
+- **High-throughput Kafka producer/consumer and async worker pool.** For a distributed system
+  handling thousands of incoming requests per second across multiple FastAPI nodes, replace
+  in-memory `BackgroundTasks` with an asynchronous Kafka producer/consumer setup paired with an
+  `asyncio` worker pool (or Celery, Dramatiq, or ARQ workers). This decouples API ingestion speed
+  from external AI response latency, guarantees event persistence through distributed consumer
+  groups, enables backpressure management, and lets API ingestion and AI worker instances scale
+  independently.
 - **WebSockets / Server-Sent Events.** The frontend polls every 4 seconds while items are active.
   That's fine at this scale, but doesn't scale well with more concurrent users/items and adds
   latency to perceived completion. A WebSocket or SSE channel that pushes status transitions would
