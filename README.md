@@ -167,6 +167,62 @@ duplicate `externalId` rejection, invalid/terminal state-machine transitions, an
 isolation (a failed analysis sets `FAILED` + `ai_error` without corrupting the rest of the row, and
 retry is rejected unless the item is currently `FAILED`).
 
+## Performance & Load Testing Analysis (k6)
+
+The k6 stress test used up to 50 virtual users (VUs) and reported 142 HTTP requests over 58.1
+seconds. It failed the `http_req_duration` threshold (`p95=30.07s`, target `<500ms`) and the
+`http_req_failed` threshold (`11.97%`, target `<1%`). Create-item latency also failed its check
+for 61 of 71 requests, and the backend returned HTTP 500 responses while listing and creating
+work items.
+
+### Key findings and failure modes
+
+- **Database connection pool starvation.** The default SQLAlchemy engine configuration provides a
+  pool of 5 connections with up to 10 overflow connections, for 15 simultaneous connections in
+  total. Concurrent requests from 50 VUs exhausted that capacity. Waiting requests then hit the
+  30-second pool timeout (`QueuePool limit of size 5 overflow 10 reached`), producing HTTP 500
+  responses for database queries and inserts. This is the direct cause of the stack traces shown
+  in the stress-test log.
+- **Upstream AI rate limiting (HTTP 429).** Burst creation schedules concurrent background AI
+  analyses. Those requests reached OpenRouter's free tier faster than its quota allowed, resulting
+  in `OpenRouter API error 429` and failed analyses. These provider failures are separate from the
+  database pool timeout, although both appear during the same burst.
+- **In-memory worker saturation.** FastAPI `BackgroundTasks` runs work in the application process
+  and shares the server's execution resources under load. Concurrent database work and slow
+  external AI calls therefore compete with request handling, causing API latency to spike to
+  `p95=30.07s`. In-memory background execution also does not provide durable queueing or
+  independent worker scaling.
+
+### Immediate and architectural solutions
+
+- **Tune the database connection pool.** For a deployment with this load profile, configure the
+  SQLAlchemy engine with larger limits, for example:
+
+  ```python
+  engine = create_engine(
+      settings.DATABASE_URL,
+      pool_pre_ping=True,
+      pool_size=20,
+      max_overflow=30,
+      pool_timeout=60.0,
+  )
+  ```
+
+  The values must still be sized against the PostgreSQL server's `max_connections` and the number
+  of application instances. Pool tuning reduces avoidable timeouts; it does not replace query
+  optimization or capacity planning.
+- **Add rate-limit resilience to AI calls.** Bound concurrent provider requests with a semaphore,
+  such as `asyncio.Semaphore(5)`, and retry transient `429` and `5xx` responses with exponential
+  backoff using a library such as `tenacity`. Retries should include a maximum attempt count and
+  jitter, and permanent failures should still transition the work item to `FAILED` with its
+  `ai_error` recorded.
+- **Use a distributed message queue in production.** Replace in-memory `BackgroundTasks` with a
+  Kafka Producer/Consumer model paired with an `asyncio` worker pool or Celery/ARQ workers. The API
+  should persist an analysis event and return quickly, while consumer groups and independently
+  scaled workers execute AI calls. This decouples ingestion from background execution, prevents
+  slow AI calls from saturating request-serving resources, provides durable event handling and
+  backpressure, and lets API and AI worker capacity scale independently.
+
 ## Recommendations & Future Work
 
 - **Distributed message queue.** Background AI processing currently runs via FastAPI
